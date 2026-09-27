@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <signal.h>
+#include <errno.h>
 
 #define MAX_ACT 10000 /* Maximo de actividades */
 #define MAX_DEPS 50 /* Maximo de dependencias por actividad */
@@ -29,6 +31,7 @@ typedef struct {
     int *sucesores; /* indice de quienes dependen de esta*/
     int num_sucesores;
     int pipes_in[MAX_DEPS]; /* pipes para recibir insumos de dependencias */
+    int abortada; /* 1 si esta actividad se descarto porque fallo una dependencia */
 } Actividad;
 
 Actividad actividades[MAX_ACT];
@@ -42,6 +45,14 @@ int   activos = 0;
 /* Cola de actividades listas para lanzar (pendientes == 0, aún no lanzadas) */
 int cola_listas[MAX_ACT];
 int frente = 0, atras = 0;
+
+/* Se pone en 1 cuando el usuario presiona Ctrl+C (SIGINT) */
+volatile sig_atomic_t interrumpido = 0;
+
+void manejar_sigint(int sig) {
+    (void)sig;
+    interrumpido = 1;
+}
 
 /* Quita espacios, tabs y saltos de línea al inicio y al final.
    Devuelve un puntero al primer carácter útil. */
@@ -198,9 +209,13 @@ int hay_ciclo(void) {
     return fin != total; /* Si no se procesaron todas hay ciclo*/
 }
 
-/* Ejecuta la tarea en un hijo: lee insumos de dependencias, simula duracion y avisa a sucesores */
+/* Ejecuta la tarea en un hijo: lee insumos, simula duracion, puede fallar,
+   y si tiene exito, avisa a sus sucesores. */
 void ejecutar_actividad(Actividad *a, int *pipes_salida) {
-    /* Leer los insumos que mandaron las actividades de las que dependemos */
+    /* Cada hijo necesita su propia secuencia de aleatorios: hereda el
+       mismo estado de rand() que tenia el padre al hacer fork(). */
+    srand(getpid());
+
     for (int d = 0; d < a->num_deps; d++) {
         if (a->pipes_in[d] != -1) {
             char insumo[128];
@@ -216,10 +231,28 @@ void ejecutar_actividad(Actividad *a, int *pipes_salida) {
     printf("[PID %d] [INICIO] Actividad '%s' (%s) iniciada - duracion: %d ms\n",
            getpid(), a->id, a->nombre, a->tiempo_ms);
     usleep((useconds_t)a->tiempo_ms * 1000);
+
+    /* Simular una falla interna:
+       - Si la variable de entorno FALLO_ID coincide con el id de esta
+         actividad, falla siempre (para poder probarlo a voluntad).
+       - Si no, hay un 5% de probabilidad de fallar, para simular fallas reales. */
+    const char *forzar = getenv("FALLO_ID");
+    int fallar = 0;
+    if (forzar != NULL && strcmp(forzar, a->id) == 0) {
+        fallar = 1;
+    } else if ((rand() % 100) < 5) {
+        fallar = 1;
+    }
+
+    if (fallar) {
+        fprintf(stderr, "[PID %d] [ERROR] Actividad '%s' (%s) fallo internamente\n",
+                getpid(), a->id, a->nombre);
+        exit(1);
+    }
+
     printf("[PID %d] [FIN] Actividad '%s' (%s) finalizada\n",
            getpid(), a->id, a->nombre);
 
-    /* Enviar mensaje de insumo a cada actividad dependiente por su pipe */
     char mensaje[128];
     snprintf(mensaje, sizeof(mensaje), "insumo de '%s' listo", a->nombre);
     for (int s = 0; s < a->num_sucesores; s++) {
@@ -230,11 +263,47 @@ void ejecutar_actividad(Actividad *a, int *pipes_salida) {
     exit(0);
 }
 
-/* Ejecuta el plan completo respetando el límite K y el orden de dependencias. */
-void ejecutar_planificador(int K) {
-    int terminadas = 0;
+/* Marca como "abortada" a todos los descendientes (directos e indirectos)
+   de la actividad que fallo. Devuelve cuantas se marcaron por primera vez. */
+int marcar_abortada(int idx_fallido) {
+    int cola[MAX_ACT];
+    int ini = 0, fin = 0;
+    int nuevas = 0;
 
-    /* Encolar las actividades que ya están listas desde el inicio */
+    for (int s = 0; s < actividades[idx_fallido].num_sucesores; s++) {
+        int v = actividades[idx_fallido].sucesores[s];
+        if (!actividades[v].abortada) {
+            cola[fin] = v;
+            fin++;
+        }
+    }
+
+    while (ini < fin) {
+        int u = cola[ini];
+        ini++;
+        if (actividades[u].abortada) continue;
+
+        actividades[u].abortada = 1;
+        nuevas++;
+
+        for (int s = 0; s < actividades[u].num_sucesores; s++) {
+            int v = actividades[u].sucesores[s];
+            if (!actividades[v].abortada) {
+                cola[fin] = v;
+                fin++;
+            }
+        }
+    }
+    return nuevas;
+}
+
+/* Ejecuta el plan completo respetando el límite K y el orden de dependencias. */
+/* Ejecuta el plan completo respetando el limite K y el orden de dependencias.
+   Aisla las fallas (solo aborta la rama afectada) y responde a Ctrl+C
+   abortando todo lo que este corriendo. */
+void ejecutar_planificador(int K) {
+    int terminadas = 0;   /* actividades ya terminadas, fallidas o abortadas */
+
     for (int i = 0; i < total; i++) {
         if (actividades[i].pendientes == 0) {
             cola_listas[atras] = i;
@@ -242,13 +311,15 @@ void ejecutar_planificador(int K) {
         }
     }
 
-    while (terminadas < total) {
-        /* Lanzar todas las que se pueda, sin pasar de K procesos vivos */
-        while (frente < atras && activos < K) {
+    while (terminadas < total && !interrumpido) {
+        while (frente < atras && activos < K && !interrumpido) {
             int i = cola_listas[frente];
             frente++;
 
-            /* Crear pipes para pasar insumos a los sucesores */
+            if (actividades[i].abortada) {
+                continue; /* seguridad: nunca deberia pasar, ver README */
+            }
+
             int *pipes_salida = NULL;
             if (actividades[i].num_sucesores > 0) {
                 pipes_salida = malloc(actividades[i].num_sucesores * sizeof(int));
@@ -263,9 +334,8 @@ void ejecutar_planificador(int K) {
                     perror("pipe");
                     exit(1);
                 }
-                pipes_salida[s] = p[1]; /* el hijo i escribe por aqui */
+                pipes_salida[s] = p[1];
 
-                /* Guardar el extremo de lectura en la dependencia correspondiente del sucesor */
                 int v = actividades[i].sucesores[s];
                 for (int d = 0; d < actividades[v].num_deps; d++) {
                     if (actividades[v].dep_idx[d] == i) {
@@ -280,17 +350,15 @@ void ejecutar_planificador(int K) {
                 perror("Error en fork");
                 exit(1);
             } else if (pid == 0) {
+                signal(SIGINT, SIG_IGN);   /* solo el padre reacciona a Ctrl+C */
                 ejecutar_actividad(&actividades[i], pipes_salida);
-                /* nunca llega aquí: ejecutar_actividad termina con exit() */
             }
 
-            /* El padre cierra los extremos de escritura porque solo los usa el hijo */
             for (int s = 0; s < actividades[i].num_sucesores; s++) {
                 close(pipes_salida[s]);
             }
             free(pipes_salida);
 
-            /* El padre tambien cierra los extremos de lectura que el hijo ya uso */
             for (int d = 0; d < actividades[i].num_deps; d++) {
                 if (actividades[i].pipes_in[d] != -1) {
                     close(actividades[i].pipes_in[d]);
@@ -298,30 +366,26 @@ void ejecutar_planificador(int K) {
                 }
             }
 
-            /* Soy el padre: registro este hijo como "corriendo" */
             pids_corriendo[activos] = pid;
             idx_corriendo[activos] = i;
             activos++;
         }
 
+        if (interrumpido) break;
+
         if (activos == 0) {
-            /* No hay nada corriendo y no hay nada más para lanzar,
-               pero faltan actividades por terminar. No debería pasar
-               si el DAG es válido y K >= 1. */
             fprintf(stderr, "Error interno: el planificador se quedó sin trabajo\n");
             break;
         }
 
-        /* Esperar, BLOQUEADO (sin busy-waiting), a que CUALQUIER hijo termine */
         int estado;
         pid_t pid_terminado = wait(&estado);
         if (pid_terminado < 0) {
+            if (errno == EINTR) break;   /* Ctrl+C nos interrumpio */
             perror("wait");
             break;
         }
-        terminadas++;
 
-        /* Buscar cuál de los "activos" corresponde a ese PID */
         int slot = -1;
         for (int s = 0; s < activos; s++) {
             if (pids_corriendo[s] == pid_terminado) {
@@ -331,22 +395,41 @@ void ejecutar_planificador(int K) {
         }
 
         int idx_terminada = idx_corriendo[slot];
-
-        /* Sacarlo de la lista de corriendo (swap-remove) */
         activos--;
         pids_corriendo[slot] = pids_corriendo[activos];
         idx_corriendo[slot]  = idx_corriendo[activos];
 
-        /* Avisar a sus sucesores que una dependencia más se cumplió */
         Actividad *term = &actividades[idx_terminada];
-        for (int s = 0; s < term->num_sucesores; s++) {
-            int v = term->sucesores[s];
-            actividades[v].pendientes--;
-            if (actividades[v].pendientes == 0) {
-                cola_listas[atras] = v;
-                atras++;
+
+        if (WIFEXITED(estado) && WEXITSTATUS(estado) != 0) {
+            fprintf(stderr, "[PADRE] La actividad '%s' (%s) fallo (codigo %d). Abortando su rama.\n",
+                    term->id, term->nombre, WEXITSTATUS(estado));
+            terminadas += 1 + marcar_abortada(idx_terminada);
+        } else {
+            terminadas++;
+            for (int s = 0; s < term->num_sucesores; s++) {
+                int v = term->sucesores[s];
+                if (actividades[v].abortada) continue;
+
+                actividades[v].pendientes--;
+                if (actividades[v].pendientes == 0) {
+                    cola_listas[atras] = v;
+                    atras++;
+                }
             }
         }
+    }
+
+    if (interrumpido) {
+        fprintf(stderr, "\n[SEREMI] Ctrl+C recibido: abortando todas las actividades en curso...\n");
+        for (int s = 0; s < activos; s++) {
+            kill(pids_corriendo[s], SIGTERM);
+        }
+        for (int s = 0; s < activos; s++) {
+            waitpid(pids_corriendo[s], NULL, 0);
+        }
+        activos = 0;
+        fprintf(stderr, "[SEREMI] Todas las actividades fueron abortadas.\n");
     }
 }
 
@@ -356,6 +439,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     srand(time(NULL));
+
+    /* Si escribimos en un pipe sin lectores, preferimos que write() falle
+       en silencio a que nos maten el proceso con SIGPIPE. */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Capturar Ctrl+C sin SA_RESTART, para que wait() se interrumpa. */
+    struct sigaction sa;
+    sa.sa_handler = manejar_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
 
     FILE *archivo = fopen(argv[1], "r");
     if (archivo == NULL) {
@@ -369,7 +463,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Demasiadas actividades (máximo %d)\n", MAX_ACT);
             break;
         }
-        if (quitar_espacios(linea)[0] == '\0') continue;   /* línea en blanco */
+        if (quitar_espacios(linea)[0] == '\0') continue;
 
         if (leer_linea(linea)) {
             total++;
@@ -387,7 +481,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Mostrar el grafo, para comprobar que quedó bien */
     for (int i = 0; i < total; i++) {
         Actividad *a = &actividades[i];
         printf("[%s] %s | pendientes=%d | sucesores:", a->id, a->nombre, a->pendientes);
@@ -416,7 +509,25 @@ int main(int argc, char *argv[]) {
 
     printf("\n=== Ejecutando plan con K=%d ===\n", K);
     ejecutar_planificador(K);
-    printf("=== Plan completo ===\n");
 
+    if (interrumpido) {
+        fprintf(stderr, "=== Plan abortado por el usuario (Ctrl+C) ===\n");
+        return 1;
+    }
+
+    int abortadas_total = 0;
+    for (int i = 0; i < total; i++) {
+        if (actividades[i].abortada) abortadas_total++;
+    }
+    if (abortadas_total > 0) {
+        printf("\n%d actividad(es) fueron abortadas por fallas en sus dependencias:\n", abortadas_total);
+        for (int i = 0; i < total; i++) {
+            if (actividades[i].abortada) {
+                printf("  - [%s] %s\n", actividades[i].id, actividades[i].nombre);
+            }
+        }
+    }
+
+    printf("=== Plan completo ===\n");
     return 0;
 }
