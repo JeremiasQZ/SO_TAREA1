@@ -33,6 +33,15 @@ typedef struct {
 Actividad actividades[MAX_ACT];
 int total = 0;
 
+/* Control de qué procesos hijos están corriendo ahora mismo */
+pid_t pids_corriendo[MAX_ACT];
+int   idx_corriendo[MAX_ACT];
+int   activos = 0;
+
+/* Cola de actividades listas para lanzar (pendientes == 0, aún no lanzadas) */
+int cola_listas[MAX_ACT];
+int frente = 0, atras = 0;
+
 /* Quita espacios, tabs y saltos de línea al inicio y al final.
    Devuelve un puntero al primer carácter útil. */
 char *quitar_espacios(char *s) {
@@ -196,6 +205,85 @@ void ejecutar_actividad(Actividad *a) {
     exit(0);
 }
 
+/* Ejecuta el plan completo respetando el límite K y el orden de dependencias. */
+void ejecutar_planificador(int K) {
+    int terminadas = 0;
+
+    /* Encolar las actividades que ya están listas desde el inicio */
+    for (int i = 0; i < total; i++) {
+        if (actividades[i].pendientes == 0) {
+            cola_listas[atras] = i;
+            atras++;
+        }
+    }
+
+    while (terminadas < total) {
+        /* Lanzar todas las que se pueda, sin pasar de K procesos vivos */
+        while (frente < atras && activos < K) {
+            int i = cola_listas[frente];
+            frente++;
+
+            pid_t pid = fork();
+            if (pid < 0) {
+                perror("Error en fork");
+                exit(1);
+            } else if (pid == 0) {
+                ejecutar_actividad(&actividades[i]);
+                /* nunca llega aquí: ejecutar_actividad termina con exit() */
+            }
+
+            /* Soy el padre: registro este hijo como "corriendo" */
+            pids_corriendo[activos] = pid;
+            idx_corriendo[activos] = i;
+            activos++;
+        }
+
+        if (activos == 0) {
+            /* No hay nada corriendo y no hay nada más para lanzar,
+               pero faltan actividades por terminar. No debería pasar
+               si el DAG es válido y K >= 1. */
+            fprintf(stderr, "Error interno: el planificador se quedó sin trabajo\n");
+            break;
+        }
+
+        /* Esperar, BLOQUEADO (sin busy-waiting), a que CUALQUIER hijo termine */
+        int estado;
+        pid_t pid_terminado = wait(&estado);
+        if (pid_terminado < 0) {
+            perror("wait");
+            break;
+        }
+        terminadas++;
+
+        /* Buscar cuál de los "activos" corresponde a ese PID */
+        int slot = -1;
+        for (int s = 0; s < activos; s++) {
+            if (pids_corriendo[s] == pid_terminado) {
+                slot = s;
+                break;
+            }
+        }
+
+        int idx_terminada = idx_corriendo[slot];
+
+        /* Sacarlo de la lista de corriendo (swap-remove) */
+        activos--;
+        pids_corriendo[slot] = pids_corriendo[activos];
+        idx_corriendo[slot]  = idx_corriendo[activos];
+
+        /* Avisar a sus sucesores que una dependencia más se cumplió */
+        Actividad *term = &actividades[idx_terminada];
+        for (int s = 0; s < term->num_sucesores; s++) {
+            int v = term->sucesores[s];
+            actividades[v].pendientes--;
+            if (actividades[v].pendientes == 0) {
+                cola_listas[atras] = v;
+                atras++;
+            }
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Uso: %s plan.txt K\n", argv[0]);
@@ -254,31 +342,15 @@ int main(int argc, char *argv[]) {
     }
     printf("\n");
 
-    /* ========================================================== */
-    /* PASO 1: fork() simple (Creación de procesos y espera)      */
-    /* ========================================================== */
-    printf("\n=== Paso 1: Prueba de fork() simple ===\n");
-    for (int i = 0; i < total; i++) {
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("Error en fork");
-            return 1;
-        } else if (pid == 0) {
-            /* Proceso hijo: ejecuta la actividad y sale */
-            ejecutar_actividad(&actividades[i]);
-        }
+    int K = atoi(argv[2]);
+    if (K < 1) {
+        fprintf(stderr, "K debe ser al menos 1\n");
+        return 1;
     }
 
-    /* Proceso padre: espera que todos los hijos terminen */
-    for (int i = 0; i < total; i++) {
-        int status;
-        pid_t pid_hijo = wait(&status);
-        if (pid_hijo > 0) {
-            printf("[PADRE] Proceso hijo PID %d finalizo con estado %d\n",
-                   pid_hijo, WEXITSTATUS(status));
-        }
-    }
-    printf("=== Fin de prueba fork() simple ===\n");
+    printf("\n=== Ejecutando plan con K=%d ===\n", K);
+    ejecutar_planificador(K);
+    printf("=== Plan completo ===\n");
 
     return 0;
 }
