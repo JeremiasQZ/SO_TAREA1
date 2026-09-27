@@ -1,8 +1,15 @@
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
+
 /* Planificador*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #define MAX_ACT 10000 /* Maximo de actividades */
 #define MAX_DEPS 50 /* Maximo de dependencias por actividad */
@@ -178,6 +185,17 @@ int hay_ciclo(void) {
     return fin != total; /* Si no se procesaron todas hay ciclo*/
 }
 
+/* Simula la ejecucion de una actividad en el proceso hijo */
+void ejecutar_actividad(Actividad *a) {
+    printf("[PID %d] [INICIO] Actividad '%s' (%s) iniciada - duracion: %d ms\n",
+           getpid(), a->id, a->nombre, a->tiempo_ms);
+    /* usleep recibe microsegundos (1 ms = 1000 us) */
+    usleep((useconds_t)a->tiempo_ms * 1000);
+    printf("[PID %d] [FIN] Actividad '%s' (%s) finalizada\n",
+           getpid(), a->id, a->nombre);
+    exit(0);
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Uso: %s plan.txt K\n", argv[0]);
@@ -235,5 +253,32 @@ int main(int argc, char *argv[]) {
         }
     }
     printf("\n");
+
+    /* ========================================================== */
+    /* PASO 1: fork() simple (Creación de procesos y espera)      */
+    /* ========================================================== */
+    printf("\n=== Paso 1: Prueba de fork() simple ===\n");
+    for (int i = 0; i < total; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("Error en fork");
+            return 1;
+        } else if (pid == 0) {
+            /* Proceso hijo: ejecuta la actividad y sale */
+            ejecutar_actividad(&actividades[i]);
+        }
+    }
+
+    /* Proceso padre: espera que todos los hijos terminen */
+    for (int i = 0; i < total; i++) {
+        int status;
+        pid_t pid_hijo = wait(&status);
+        if (pid_hijo > 0) {
+            printf("[PADRE] Proceso hijo PID %d finalizo con estado %d\n",
+                   pid_hijo, WEXITSTATUS(status));
+        }
+    }
+    printf("=== Fin de prueba fork() simple ===\n");
+
     return 0;
 }
