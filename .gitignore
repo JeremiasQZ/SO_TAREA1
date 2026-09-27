@@ -1,0 +1,8 @@
+# Binarios compilados
+/planificador
+planificador_debug
+*.o
+*.dSYM/
+
+# Archivos de macOS
+.DS_Store

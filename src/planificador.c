@@ -1,4 +1,4 @@
-/* Planificador */
+/* Planificador*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,12 +98,14 @@ int leer_linea(char *linea) {
 }
 
 /* Devuelve la posicion de la actividad con ese ID, o -1 si no existe*/
+
 int buscar_indice (char *id) {
     for (int i = 0; i < total; i++) {
         if (strcmp(actividades[i].id, id) == 0) {
             return i;
         }
     }
+
     return -1;
 }
 
@@ -164,7 +166,7 @@ int hay_ciclo(void) {
     while (inicio < fin) {
         int u = cola[inicio];
         inicio++;
-        for (int s = 0; actividades[u].num_sucesores; s++) {
+        for (int s = 0; s < actividades[u].num_sucesores; s++) {   /* <-- CORREGIDO: faltaba "s <" */
             int v = actividades[u].sucesores[s];
             pendientes[v]--;
             if (pendientes[v] == 0) {
@@ -205,24 +207,33 @@ int main(int argc, char *argv[]) {
     }
     fclose(archivo);
 
-    /* Construir grafo y chequear ciclos */
     if (!construir_grafo()) {
-        fprintf(stderr, "Error al construir el grafo de dependencias.\n");
         return 1;
     }
     if (hay_ciclo()) {
-        fprintf(stderr, "Error: El plan contiene ciclos circulares.\n");
+        fprintf(stderr, "Error: el plan tiene un ciclo de dependencias\n");
         return 1;
     }
 
-    /* Mostrar lo leído, para comprobar que el parseo funciona */
+    /* Mostrar el grafo, para comprobar que quedó bien */
     for (int i = 0; i < total; i++) {
-        printf("[%s] %s  %d ms  deps:", actividades[i].id,
-               actividades[i].nombre, actividades[i].tiempo_ms);
-        for (int j = 0; j < actividades[i].num_deps; j++) {
-            printf(" %s", actividades[i].deps[j]);
+        Actividad *a = &actividades[i];
+        printf("[%s] %s | pendientes=%d | sucesores:", a->id, a->nombre, a->pendientes);
+        if (a->num_sucesores == 0) {
+            printf(" (ninguno)");
+        }
+        for (int s = 0; s < a->num_sucesores; s++) {
+            printf(" %s", actividades[a->sucesores[s]].id);
         }
         printf("\n");
     }
+
+    printf("Listas para ejecutar al inicio:");
+    for (int i = 0; i < total; i++) {
+        if (actividades[i].pendientes == 0) {
+            printf(" %s", actividades[i].id);
+        }
+    }
+    printf("\n");
     return 0;
 }
