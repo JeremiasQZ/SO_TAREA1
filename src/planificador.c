@@ -235,12 +235,13 @@ void ejecutar_actividad(Actividad *a, int *pipes_salida) {
     /* Simular una falla interna:
        - Si la variable de entorno FALLO_ID coincide con el id de esta
          actividad, falla siempre (para poder probarlo a voluntad).
-       - Si no, hay un 5% de probabilidad de fallar, para simular fallas reales. */
+       - Si la variable SIMULAR_FALLOS está activa, hay un 5% de probabilidad al azar. */
     const char *forzar = getenv("FALLO_ID");
+    const char *simular_azar = getenv("SIMULAR_FALLOS");
     int fallar = 0;
     if (forzar != NULL && strcmp(forzar, a->id) == 0) {
         fallar = 1;
-    } else if ((rand() % 100) < 5) {
+    } else if (simular_azar != NULL && (rand() % 100) < 5) {
         fallar = 1;
     }
 

@@ -4,5 +4,7 @@ planificador_debug
 *.o
 *.dSYM/
 
-# Archivos de macOS
-.DS_Store
+# Archivos de prueba temporales
+plan_estres.txt
+*.txt.out
+salida*.txt
