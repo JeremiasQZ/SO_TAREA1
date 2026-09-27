@@ -28,6 +28,7 @@ typedef struct {
     int pendientes; /* Cuantas dependencias faltan por terminar*/
     int *sucesores; /* indice de quienes dependen de esta*/
     int num_sucesores;
+    int pipes_in[MAX_DEPS]; /* pipes para recibir insumos de dependencias */
 } Actividad;
 
 Actividad actividades[MAX_ACT];
@@ -140,6 +141,9 @@ int construir_grafo(void) {
     for (int i = 0; i < total; i++) {
         Actividad *a = &actividades[i];
         a->pendientes = a->num_deps;
+        for (int j = 0; j < MAX_DEPS; j++) {
+            a->pipes_in[j] = -1;
+        }
 
         for (int j = 0; j < a->num_deps; j++) {
             int k = buscar_indice(a->deps[j]);
@@ -194,14 +198,35 @@ int hay_ciclo(void) {
     return fin != total; /* Si no se procesaron todas hay ciclo*/
 }
 
-/* Simula la ejecucion de una actividad en el proceso hijo */
-void ejecutar_actividad(Actividad *a) {
+/* Ejecuta la tarea en un hijo: lee insumos de dependencias, simula duracion y avisa a sucesores */
+void ejecutar_actividad(Actividad *a, int *pipes_salida) {
+    /* Leer los insumos que mandaron las actividades de las que dependemos */
+    for (int d = 0; d < a->num_deps; d++) {
+        if (a->pipes_in[d] != -1) {
+            char insumo[128];
+            int leidos = read(a->pipes_in[d], insumo, sizeof(insumo) - 1);
+            if (leidos > 0) {
+                insumo[leidos] = '\0';
+                printf("[PID %d] [%s] Recibio: %s\n", getpid(), a->id, insumo);
+            }
+            close(a->pipes_in[d]);
+        }
+    }
+
     printf("[PID %d] [INICIO] Actividad '%s' (%s) iniciada - duracion: %d ms\n",
            getpid(), a->id, a->nombre, a->tiempo_ms);
-    /* usleep recibe microsegundos (1 ms = 1000 us) */
     usleep((useconds_t)a->tiempo_ms * 1000);
     printf("[PID %d] [FIN] Actividad '%s' (%s) finalizada\n",
            getpid(), a->id, a->nombre);
+
+    /* Enviar mensaje de insumo a cada actividad dependiente por su pipe */
+    char mensaje[128];
+    snprintf(mensaje, sizeof(mensaje), "insumo de '%s' listo", a->nombre);
+    for (int s = 0; s < a->num_sucesores; s++) {
+        write(pipes_salida[s], mensaje, strlen(mensaje) + 1);
+        close(pipes_salida[s]);
+    }
+
     exit(0);
 }
 
@@ -223,13 +248,54 @@ void ejecutar_planificador(int K) {
             int i = cola_listas[frente];
             frente++;
 
+            /* Crear pipes para pasar insumos a los sucesores */
+            int *pipes_salida = NULL;
+            if (actividades[i].num_sucesores > 0) {
+                pipes_salida = malloc(actividades[i].num_sucesores * sizeof(int));
+                if (pipes_salida == NULL) {
+                    perror("malloc");
+                    exit(1);
+                }
+            }
+            for (int s = 0; s < actividades[i].num_sucesores; s++) {
+                int p[2];
+                if (pipe(p) < 0) {
+                    perror("pipe");
+                    exit(1);
+                }
+                pipes_salida[s] = p[1]; /* el hijo i escribe por aqui */
+
+                /* Guardar el extremo de lectura en la dependencia correspondiente del sucesor */
+                int v = actividades[i].sucesores[s];
+                for (int d = 0; d < actividades[v].num_deps; d++) {
+                    if (actividades[v].dep_idx[d] == i) {
+                        actividades[v].pipes_in[d] = p[0];
+                        break;
+                    }
+                }
+            }
+
             pid_t pid = fork();
             if (pid < 0) {
                 perror("Error en fork");
                 exit(1);
             } else if (pid == 0) {
-                ejecutar_actividad(&actividades[i]);
+                ejecutar_actividad(&actividades[i], pipes_salida);
                 /* nunca llega aquí: ejecutar_actividad termina con exit() */
+            }
+
+            /* El padre cierra los extremos de escritura porque solo los usa el hijo */
+            for (int s = 0; s < actividades[i].num_sucesores; s++) {
+                close(pipes_salida[s]);
+            }
+            free(pipes_salida);
+
+            /* El padre tambien cierra los extremos de lectura que el hijo ya uso */
+            for (int d = 0; d < actividades[i].num_deps; d++) {
+                if (actividades[i].pipes_in[d] != -1) {
+                    close(actividades[i].pipes_in[d]);
+                    actividades[i].pipes_in[d] = -1;
+                }
             }
 
             /* Soy el padre: registro este hijo como "corriendo" */
